@@ -1,0 +1,313 @@
+---
+title: "Letting Russ Cook"
+author: "Richard Anderson"
+date: "7/18/2020"
+output: html_document
+---
+
+```{r setup, include=T, warning = F, message = F}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+
+library(rstan)
+library(lme4)
+library(tidyverse)
+library(vip)
+library(tidymodels)
+library(workflows)
+library(dials)
+library(tune)
+library(DT)
+
+set.seed(1234)
+
+dat <- readRDS('C:/Users/richjand/Documents/nfl-pbp.RDS') %>%
+  tibble()
+
+post16 <- filter(dat, season >= 2016 & 
+                     season_type == 'REG' & 
+                     down %in% c(1,2,3) &
+                     !is.na(qb_dropback) &
+                     !is.na(score_differential)) %>%
+  mutate(qb_dropback = factor(qb_dropback),
+         off_to = if_else(posteam_type == 'away', away_timeouts_remaining, home_timeouts_remaining),
+         def_to = if_else(posteam_type == 'away', home_timeouts_remaining, away_timeouts_remaining)) %>%
+  dplyr::select(qb_dropback, down, ydstogo, yardline_100, score_differential, qtr, half_seconds_remaining, off_to, def_to)
+
+xgb_res <- readRDS('C:/Users/richjand/Documents/xgb-grid-search.RDS')
+```
+
+I am a Seahawks fan and a data scientist. As such, I have strong and predictable feelings about how the Seahawks have chosen to chosen to use Russell Wilson in the post Legion of Boom era. There's a feeling among fans that the Seahawks are too rigid in their philosophy, choosing to emphasize an up-and-down running game instead of putting the ball in Russ' hands and letting the chips fall where they may. 
+
+[Warren Sharp](https://twitter.com/SharpFootball/status/1281657545598341121) recently posted that in what we might consider neutral game states where the Seahawks are not forced to run or throw, the Seahawks choose to run at rates matched only by teams with bad quarterbacks. Most analyses I've seen of this question do something similar to Sharp where you identify a subset of plays that are somewhat game script neutral and look at the team's tendencies. I'll approach this a little differently. I'm going to use data from the good people at [nflfastR](https://github.com/mrcaseb/nflfastR) to estimate the probability of a qb dropback given the game state, a multilevel model to estimate just how little the Seahawks passed relative to what we would expect given our estimated dropback probabilities, followed by another multilevel model to estimate how much run-heavier the Seahawks are given the game states they faced and the fact that they have one of the best quarterbacks in the league.
+
+## Estimating Pr(QB Dropback)
+
+Part of the impetus for this project was to learn how to use the [tidyModels](https://www.tidymodels.org/) and [parsnip](https://github.com/tidymodels/parsnip) packages so I'm going to cover how I built the models with these packages in some detail. I won't be offended if you want to skip ahead. Also, before getting into the details I'll link interested readers to posts by [Julia Silge](https://juliasilge.com/blog/xgboost-tune-volleyball/) and [Rebecca Barter](http://www.rebeccabarter.com/blog/2020-03-25_machine_learning/) which were extremely helpful in getting up and running in the tidyModels universe. I really can't overemphasize how good these two posts were.
+
+Ultimately the model I'll want to fit is:
+
+<center>
+
+$y_{it} \sim Bernoulli(p_{it})$
+
+$logit(p_{it}) = \alpha + \gamma_{t} + \beta_{1}\hat{p}_i + \beta_{2}qb_{i}$
+
+</center>
+
+where $y_{it}$ is going to be whether team $t$ called a pass on play $i$, $\gamma_{t}$ is a random effect for team, $\hat{p}_i$ is the probability of a qb dropback that we'll generate with our xgboost model, and $qb_{i}$ is going to be the ability of the quarterback for play $i$ which we'll measure using yet another multilevel model. By including the probability of a dropback as well as the ability of the quarterback we can interpret $/gamma$ as a measure of team tendencies, having controlled for game state and quarterback ability.
+
+I predict the probability of a dropback using the nflfastR-provided variables that collectively capture the game state at the time of the play. These are:
+
+  - Down
+  - Yards for first down
+  - Yard line
+  - Score Differential
+  - Quarter
+  - Time remaining in half
+  - Number of timeouts for the offense and defense
+  
+I'm going to use an xgboost model because we know there are non-linearities in the relationship between independent variables and dependent variable as well as some complex interactions between the variables. I can't say anything about xgboost that hasn't been said better in a million other data science posts so I'll just say that I, like so many others, have found xgboost extremely useful for a variety of projects. That said, I've found the xgboost package to be a little difficult to work with which is why I'm excited to give tidyModels a try.
+
+## Tidying my xgboost
+
+### Prepping the Data
+The first step is going to be to split my data into train and test, which we can do with the <code>initial_split</code> function. By default this function will use 75% of the data for training and the remaining 25% for testing and that seems fine for what we're doing here.
+
+```{r}
+dat_split <- initial_split(post16)
+dat_train <- training(dat_split)
+dat_test <- testing(dat_split)
+```
+
+We're going be tuning our xgboost parameters so we'll want to be able to cross-validate. We can create cross-validation sets using <code>vfold_cv()</code> 
+
+```{r}
+qb_folds <- vfold_cv(dat_train)
+```
+
+
+### Prepping the Model
+Next we'll define a recipe using the <code>recipe()</code> function from the <code>recipes</code> package. Recipes involve setting a formula that looks like what you use to train most data in R and doing any pre-processing (scaling, normalizing, etc...) that you want to do to your variables. Since I'm working with xgboost I don't need to worry about preprocessing so I'll just define my formula below.
+
+```{r}
+qb_recipe <- recipe(qb_dropback ~ down + 
+                      ydstogo + 
+                      yardline_100 + 
+                      score_differential + 
+                      qtr + 
+                      half_seconds_remaining +
+                      off_to +
+                      def_to,
+    data = dat_train)
+
+```
+
+Now that we have a recipe we will get our model set up. We're going to use a boosted tree model which carries with it a bunch of tuneable hyperparameters. I'm going to fix the number of trees to keep cross-validation from getting out of hand and tell the model to stop when there has been no improvement in 100 rounds. Everything else is going to be selected based on model fit.
+
+The <code>set_engine()</code> specifies the package that the model is coming from so if you preferred to use <code>gbm</code> instead of <code>xgboost</code> you would specify <code>set_engine("gbm")</code>. <code>set_mode()</code> can be set to "classification" or "regression" and is going to determine which loss function we will minimize.
+
+```{r}
+qb_model <- 
+  boost_tree(
+    mtry = tune(),
+    trees = 2000, 
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),                    
+    sample_size = tune(),         
+    stop_iter = 100
+  ) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+qb_model
+```
+
+Finally, we're going to specify a workflow which is going to gather the recipe and model we built above. This is going to make it very easy to do parameter tuning and model building without repeatedly specifying the same information.
+
+```{r}
+qb_workflow <- workflow() %>%
+  add_recipe(qb_recipe) %>%
+  add_model(qb_model)
+```
+
+### Parameter Tuning
+
+Now it's time to actually do some modeling! We'll use our cross-validation folds to try a bunch of different potential parameter values and return which gives us the best out of sample fit. We'll try 40 different combinations sampled from across the hyperparameter space. Note that the <code>mtry</code> and <code>sample_size</code> parameters require addition arguments. <code>mtry()</code> refers to the number of columns to be sampled which depends on the number of variables you're using at each split. This is one where you need to be careful. If the data frame you specify for <code>finizalize</code> has more variables than you actually plan on training with, you will waste your time testing mtry values that don't make any sense for your problem. The <code>sample_size</code> argument requires a number between 0 and 1 as it's the proportion of the data that you'll use in the fitting routine.
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  finalize(mtry(), dat_train),
+  min_n(),
+  tree_depth(),
+  learn_rate(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  size = 40
+)
+```
+
+Tuning your grid is as easy as specifying a workflow, your cross-validation data, and the grid of values to be tested. I specify <code>save_pred = TRUE</code> which is going to save all of the cross-validation predictions for later evaluation. Note that this is going to take awhile. A grid of 40 took ~6 hours on my machine. I'd set this off overnight and save the results so you can reload the object without rebuilding every time.
+
+```{r, eval = F}
+  xgb_res <- tune_grid(
+    qb_workflow,
+    resamples = qb_folds,
+    grid = xgb_grid,
+    control = control_grid(save_pred = TRUE)
+  )
+```
+
+Julia Silge's post had a plot to show the relationship between different parameter values and model performance that I'm going to use here. It's tough to draw any sweeping conclusions though it looks like higher values of mtry and, to a certain extent, tree depth perform better.
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC") +
+  theme_minimal()
+```
+
+We can extract the best-performing set of hyperparameters using the <code>select_best()</code> function and use those values to finalize our workflow.
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+
+qb_xgb <- finalize_workflow(
+  qb_workflow,
+  parameters = best_auc
+)
+```
+
+At this point we're ready to evaluate the performance of the model trained on our training data with our chosen hyperparameters on our test data which we can do with the <code>last_fit()</code> function. We'll need to give the function our finalized workflow as well as our split data.
+
+```{r}
+final_mod <- last_fit(qb_xgb, dat_split)
+```
+
+### Model Evaluation
+We can find out just how well the model did using <code>collect_metrics</code>. We ended up with 69% accuracy and an AUC of .76 which seems about right given the application. It's safe to assume that coaches are playing some kind of mixed-strategy equilibrium and are choosing plays specifically to avoid easy pattern detection, but we're clearly identifying patterns that make passing more or less likely. Again, Julia Silge did a great job visualizing model outputs in her post and I'm going to basically lift her code for this ROC curve plot
+
+```{r}
+collect_metrics(final_mod)
+final_mod %>%
+  collect_predictions() %>%
+  roc_curve(qb_dropback, .pred_0) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(size = 1.5, color = "midnightblue") +
+  xlab('1 - Specificity') +
+  ylab('Sensitivity') +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  ) +
+  ggtitle('ROC Curve')
+  theme_minimal()
+```
+
+As a final check on our results let's check calibration in our test data. We want the plays where we give a .75 pass probability to have a .75 pass probability and it looks like that's the case! There's only 14 plays in the far right dot so I'm not going to lose any sleep over it.
+
+```{r}
+final_mod %>%
+  collect_predictions() %>%
+  mutate(pred_rounded = round(.pred_1,1)) %>%
+  group_by(pred_rounded) %>%
+  summarise(mean_prediction = mean(.pred_1),
+            mean_actual = mean(as.numeric(qb_dropback) - 1),
+            n = n(),
+            se = sd(as.numeric(qb_dropback) - 1 - .pred_1)/sqrt(n)) %>%
+  ggplot(aes(x = pred_rounded, y = mean_actual)) +
+  geom_abline() +
+  geom_point(aes(size = n)) +
+  theme_minimal() +
+  xlab('Predicted Probability') +
+  ylab('Actual Probability') +
+  ggtitle('Calibration Plot, Test Data') +
+  ylim(0,1) +
+  xlim(0,1)
+```
+
+Finally, now that we've built some confidence in the model we're going to build and predict the model on all data since 2016.
+
+```{r}
+final_qb_mod <- fit(qb_xgb, post16)
+post16$dropback_prob <- predict(final_qb_mod, new_data = post16, type = 'prob')$.pred_1
+```
+
+And as a basic sanity check let's make sure the model thinks passing is more likely in situations that we would expect. Generally speaking, throwing is more likely on third down and more likely with more yards to go which is what we'd hope to see.
+
+```{r}
+post16 %>%
+  mutate(Down = factor(down)) %>%
+  filter(down > 1 & ydstogo < 15) %>%
+  ggplot(aes(x = ydstogo, y = dropback_prob, colour = Down)) +
+  geom_smooth() +
+  ylim(0,1) +
+  scale_x_continuous(breaks = seq(0,15, by = 1)) +
+  ylab('Predicted Dropback Probability') +
+  xlab('Yards to Go') +
+  theme_minimal()
+```
+
+
+## Measuring Team Passing Ability
+
+At this point we could stop and just build a multilevel model with our pass probability and random effects for team, but part of why this question is interesting and/or infuriating is that there's a feeling that teams ahta are good at throwing the ball are generally more likely to throw, making Russel Wilson's usage even more of an outlier than we might otherwise believe. That requires that we measure team passing ability.
+
+Completion Percentage Over Expectation (CPOE) and Expected Points Added (EPA) per play are available from nflscrapR and I'm going to use EPA per play. The primary reason for EPA over CPOE is that the decision faced by the coach is one of weighting the expected values of running vs. passing given the ability of their offense, not necessarily the raw ability of their quarterback. If you had a QB who was good but an offensive coordinator who couldn't get them open it might be reasonable to emphasize running, even if the true talent of the quarterback was high. Ultimately I expect it'll make a small difference but I do think that EPA/play more closely maps onto the decision faced by the coach.
+
+I come from baseball analytics and we love multilevel models. The ability to account for repeated observations and differing sample sizes makes it a natural for sports analytics where we're repeatedly observing the same units. I'm going to use the <code>lme4</code> package to fit a model that estimates EPA with an intercept and random effects for team/season. This will return regularized estimates of EPA/play for each team in each season which we'll use as our proxy for how good a team is at passing the ball.
+
+```{r}
+post16_lmer_dat <- filter(dat, season >= 2016 & 
+                   season_type == 'REG' & 
+                   down %in% c(1,2,3) &
+                   !is.na(qb_dropback) &
+                   !is.na(score_differential)) %>%
+  mutate(qb_dropback = factor(qb_dropback),
+         off_to = if_else(posteam_type == 'away', away_timeouts_remaining, home_timeouts_remaining),
+         def_to = if_else(posteam_type == 'away', home_timeouts_remaining, away_timeouts_remaining))
+
+dropbacks <- filter(post16_lmer_dat, qb_dropback == 1)
+
+mod <- lmer(epa ~ 1 + (1|posteam:season), data = dropbacks)
+
+ranef_rows <- str_split(rownames(ranef(mod)$'posteam:season'), ':')
+season <- sapply(ranef_rows, '[', 2)
+posteam <- sapply(ranef_rows, '[', 1)
+
+passing_ranef <- data.frame(Team = posteam,
+                            Season = season,
+                            passing_re = round(ranef(mod)$'posteam:season'[,1], 2))
+
+```
+
+Our best EPA/dropback teams are the 2018 Chiefs, 2016 Falcons, and 2019 Ravens, all of which check out. Important to note with the Ravens that this includes dropbacks that turn into QB scrambles. The worst passing team is the 2018 Cardinals who threw for 18 interceptions against 15 touchdowns. Woof.
+
+```{r}
+passing_ranef %>% 
+  arrange(desc(passing_re)) %>%
+  rename('EPA/Play Above Average' = passing_re) %>%
+  datatable(filter = 'top', rownames = FALSE, options = list(
+ columnDefs = list(list(className = 'dt-center', targets = 0:2))
+  )
+  )
+```
+
+## Final Model
+
+We have estimates of dropback probability and team ability which means we can move to estimating the model we specified at the beginning.
+
+```{r}
+post16 %>%
+  left_join(passing_ranef, by = c('posteam'))
+```
