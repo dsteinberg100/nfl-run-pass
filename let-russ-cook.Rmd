@@ -236,17 +236,28 @@ final_mod %>%
   xlim(0,1)
 ```
 
-Finally, now that we've built some confidence in the model we're going to build and predict the model on all data since 2016.
+Finally, now that we've built some confidence in the model we're going to build (using <code>fit()</code>) and predict (using <code>predict()</code>) the model on all data since 2016.
 
 ```{r}
 final_qb_mod <- fit(qb_xgb, post16)
-post16$dropback_prob <- predict(final_qb_mod, new_data = post16, type = 'prob')$.pred_1
+
+post16_pred_dat <- filter(dat, season >= 2016 & 
+                   season_type == 'REG' & 
+                   down %in% c(1,2,3) &
+                   !is.na(qb_dropback) &
+                   !is.na(score_differential)) %>%
+  mutate(qb_dropback = factor(qb_dropback),
+         off_to = if_else(posteam_type == 'away', away_timeouts_remaining, home_timeouts_remaining),
+         def_to = if_else(posteam_type == 'away', home_timeouts_remaining, away_timeouts_remaining)) %>%
+  dplyr::select(qb_dropback, down, ydstogo, yardline_100, score_differential, qtr, half_seconds_remaining, off_to, def_to, epa, posteam)
+
+post16_pred_dat$dropback_prob <- predict(final_qb_mod, new_data = post16_pred_dat, type = 'prob')$.pred_1
 ```
 
 And as a basic sanity check let's make sure the model thinks passing is more likely in situations that we would expect. Generally speaking, throwing is more likely on third down and more likely with more yards to go which is what we'd hope to see.
 
 ```{r}
-post16 %>%
+post16_pred_dat %>%
   mutate(Down = factor(down)) %>%
   filter(down > 1 & ydstogo < 15) %>%
   ggplot(aes(x = ydstogo, y = dropback_prob, colour = Down)) +
@@ -268,16 +279,7 @@ Completion Percentage Over Expectation (CPOE) and Expected Points Added (EPA) pe
 I come from baseball analytics and we love multilevel models. The ability to account for repeated observations and differing sample sizes makes it a natural for sports analytics where we're repeatedly observing the same units. I'm going to use the <code>lme4</code> package to fit a model that estimates EPA with an intercept and random effects for team/season. This will return regularized estimates of EPA/play for each team in each season which we'll use as our proxy for how good a team is at passing the ball.
 
 ```{r}
-post16_lmer_dat <- filter(dat, season >= 2016 & 
-                   season_type == 'REG' & 
-                   down %in% c(1,2,3) &
-                   !is.na(qb_dropback) &
-                   !is.na(score_differential)) %>%
-  mutate(qb_dropback = factor(qb_dropback),
-         off_to = if_else(posteam_type == 'away', away_timeouts_remaining, home_timeouts_remaining),
-         def_to = if_else(posteam_type == 'away', home_timeouts_remaining, away_timeouts_remaining))
-
-dropbacks <- filter(post16_lmer_dat, qb_dropback == 1)
+dropbacks <- filter(post16_pred_dat, qb_dropback == 1)
 
 mod <- lmer(epa ~ 1 + (1|posteam:season), data = dropbacks)
 
@@ -308,6 +310,6 @@ passing_ranef %>%
 We have estimates of dropback probability and team ability which means we can move to estimating the model we specified at the beginning.
 
 ```{r}
-post16 %>%
+post16_pred_dat %>%
   left_join(passing_ranef, by = c('posteam'))
 ```
