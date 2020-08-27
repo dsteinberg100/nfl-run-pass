@@ -1,0 +1,383 @@
+---
+title: "Estimating Run/Pass Tendencies with nflfastR"
+author: "Richard Anderson"
+output: html_document
+---
+
+```{r setup, include=T, warning = F, message = F}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+
+library(rstan)
+library(lme4)
+library(tidyverse)
+library(vip)
+library(tidymodels)
+library(workflows)
+library(dials)
+library(tune)
+library(DT)
+library(brms)
+library(arm)
+library(tidybayes)
+
+set.seed(1234)
+
+dat <- readRDS('C:/Users/richjand/Documents/nfl-pbp.RDS') %>%
+  tibble()
+
+post16 <- filter(dat, season >= 2016 & 
+                     season_type == 'REG' & 
+                     down %in% c(1,2,3) &
+                     !is.na(qb_dropback) &
+                     !is.na(score_differential)) %>%
+  mutate(qb_dropback = factor(qb_dropback),
+         off_to = if_else(posteam_type == 'away', away_timeouts_remaining, home_timeouts_remaining),
+         def_to = if_else(posteam_type == 'away', home_timeouts_remaining, away_timeouts_remaining)) %>%
+  dplyr::select(qb_dropback, down, ydstogo, yardline_100, score_differential, qtr, half_seconds_remaining, off_to, def_to)
+
+xgb_res <- readRDS('C:/Users/richjand/Documents/nfl-run-pass/rds-objects/xgb-grid-search.RDS')
+final_mod <- readRDS('C:/Users/richjand/Documents/nfl-run-pass/rds-objects/final-mod-test-dat.RDS')
+final_qb_mod <- readRDS('C:/Users/richjand/Documents/nfl-run-pass/rds-objects/final-full-xgb.RDS')
+fit_epa <- readRDS('C:/Users/richjand/Documents/nfl-run-pass/rds-objects/with_epa_model.RDS')
+fit_no_epa <- readRDS('C:/Users/richjand/Documents/nfl-run-pass/rds-objects/no_epa_model.RDS')
+
+samps_epa <- rstan::extract(fit_epa, pars = 'mu')$mu
+quantile_025_epa <- apply(samps_epa, 2, quantile, .025)
+quantile_975_epa <- apply(samps_epa, 2, quantile, .975)
+mean_epa <- apply(samps_epa, 2, mean)
+
+samps_no_epa <- rstan::extract(fit_no_epa, pars = 'mu')$mu
+quantile_025_no_epa <- apply(samps_no_epa, 2, quantile, .025)
+quantile_975_no_epa <- apply(samps_no_epa, 2, quantile, .975)
+mean_no_epa <- apply(samps_no_epa, 2, mean)
+
+teams <- dat %>%
+  filter(season >= 2016 & !is.na(posteam)) %>%
+  dplyr::select(posteam, season) %>%
+  mutate(team_string = str_c(posteam, '-', season),
+         team_idx = as.numeric(factor(team_string))) %>%
+  group_by(posteam, season) %>%
+  summarise(team_idx = max(team_idx)) %>%
+  ungroup()
+  
+teams$q_025_epa <- quantile_025_epa
+teams$q_975_epa <- quantile_975_epa
+teams$mean_epa <- mean_epa
+
+teams$q_025_no_epa <- quantile_025_no_epa
+teams$q_975_no_epa <- quantile_975_no_epa
+teams$mean_no_epa <- mean_no_epa
+
+```
+
+As a Seahawks fan who spends a good amount of time online I've had the opportunity to read a lot of thoughts about run/pass tendencies. The common way to establish whether a team is run/pass heavy is to identify a subset of plays where they analyst believes are roughly game-script neutral where the team is not bound by needing to pass to catch up or run to kill clock ([See Warren Sharp's Tweet](https://twitter.com/SharpFootball/status/1281657545598341121) and see what decisions teams actually made. The problem with this approach is that treating all first and second down plays where the team's win probability is between 20% and 80% as the same is throwing away a lot of useful information. Seeing a team run on 2nd and 11 (again, Seahawks fan here) tells us something very different than seeing a team run on 2nd and 1. Thanks to the awesome people at nflscrapR and nflfastR we can build that kind of context into our analysis. 
+
+This post is basically an exercise in feature engineering where we're trying to create a measure that we can use as an input in another model. Ultimately the model I'll want to fit to evaluate team tendencies is:
+
+<center>
+
+$y_{it} \sim Bernoulli(p_{it})$
+
+$logit(p_{it}) = \alpha + \gamma_{t} + \beta_{1}\hat{p}_i + \psi\textbf{X}_{i}$
+
+</center>
+
+where $y_{it}$ is going to be whether team $t$ called a pass on play $i$, $\gamma_{t}$ is a team effect, and $\psi\textbf{X}_{i}$ is going to be any other information we want to include such as quarterback ability or quality of defense. $\hat{p}_i$ is the probability of a qb dropback that we'll generate with our xgboost model. In effect, this gives us an expectation from which we'll measure deviances at the team level.
+
+## Estimating Pr(QB Dropback)
+
+Part of the impetus for this project was to learn how to use the [tidyModels](https://www.tidymodels.org/) and [parsnip](https://github.com/tidymodels/parsnip) packages so I'm going to cover how I built the models with these packages in some detail. I won't be offended if you want to skip ahead. Also, before getting into the details I'll link interested readers to posts by [Julia Silge](https://juliasilge.com/blog/xgboost-tune-volleyball/) and [Rebecca Barter](http://www.rebeccabarter.com/blog/2020-03-25_machine_learning/) which were extremely helpful in getting up and running in the tidyModels universe. I really can't overemphasize how good these two posts were.
+
+I predict the probability of a dropback using the nflfastR-provided variables that collectively capture the game state at the time of the play. These are:
+
+  - Down
+  - Yards for first down
+  - Yard line
+  - Score Differential
+  - Quarter
+  - Time remaining in half
+  - Number of timeouts for the offense and defense
+  
+I'm going to use an xgboost model because we know there are non-linearities in the relationship between independent variables and dependent variable as well as some complex interactions between the variables. I can't say anything about xgboost that hasn't been said better in a million other data science posts so I'll just say that I, like so many others, have found xgboost extremely useful for a variety of projects. That said, I've found the xgboost package to be a little difficult to work with which is why I'm excited to give tidyModels a try.
+
+## Tidying my xgboost
+
+### Prepping the Data
+The first step is going to be to split my data into train and test, which we can do with the <code>initial_split</code> function. By default this function will use 75% of the data for training and the remaining 25% for testing and that seems fine for what we're doing here.
+
+```{r}
+dat_split <- initial_split(post16)
+dat_train <- training(dat_split)
+dat_test <- testing(dat_split)
+```
+
+We're going be tuning our xgboost parameters so we'll want to be able to cross-validate. We can create cross-validation sets using <code>vfold_cv()</code>.
+
+```{r}
+qb_folds <- vfold_cv(dat_train)
+```
+
+
+### Prepping the Model
+Next we'll define a recipe using the <code>recipe()</code> function from the <code>recipes</code> package. Recipes involve setting a formula that looks like what you use to train most models in R and doing any pre-processing (scaling, normalizing, etc...) that you want to do to your variables. Since I'm working with xgboost I don't need to worry about preprocessing so I'll just define my formula below.
+
+```{r}
+qb_recipe <- recipe(qb_dropback ~ down + 
+                      ydstogo + 
+                      yardline_100 + 
+                      score_differential + 
+                      qtr + 
+                      half_seconds_remaining +
+                      off_to +
+                      def_to,
+    data = dat_train)
+
+```
+
+Now that we have a recipe we will get our model set up. We're going to use a boosted tree model which carries with it a bunch of tuneable hyperparameters. I'm going to fix the number of trees to keep cross-validation from getting out of hand and tell the model to stop when there has been no improvement in 100 rounds. Everything else is going to be selected based on model fit.
+
+The <code>set_engine()</code> specifies the package that the model is coming from so if you preferred to use <code>gbm</code> instead of <code>xgboost</code> you would specify <code>set_engine("gbm")</code>. <code>set_mode()</code> can be set to "classification" or "regression" and is going to determine which loss function we will minimize.
+
+```{r}
+qb_model <- 
+  boost_tree(
+    mtry = tune(),
+    trees = 2000, 
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),                    
+    sample_size = tune(),         
+    stop_iter = 100
+  ) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+qb_model
+```
+
+Finally, we're going to specify a workflow which is going to gather the recipe and model we built above. This is going to make it very easy to do parameter tuning and model building without repeatedly specifying the same information.
+
+```{r}
+qb_workflow <- workflow() %>%
+  add_recipe(qb_recipe) %>%
+  add_model(qb_model)
+```
+
+### Parameter Tuning
+
+Now it's time to actually do some modeling! We'll use our cross-validation folds to try a bunch of different potential parameter values and return which gives us the best out of sample fit. We'll try 40 different combinations sampled from across the hyperparameter space. Note that the <code>mtry</code> and <code>sample_size</code> parameters require additional arguments. <code>mtry()</code> refers to the number of columns to be sampled at each split. This is one where you need to be careful. If the data frame you specify for <code>finizalize</code> has more variables than you actually plan on training with, you will waste your time testing mtry values that don't make any sense for your problem. The <code>sample_size</code> argument requires a number between 0 and 1 as it's the proportion of the data that you'll use in the fitting routine.
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  finalize(mtry(), dat_train),
+  min_n(),
+  tree_depth(),
+  learn_rate(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  size = 40
+)
+```
+
+Tuning your grid is as easy as specifying a workflow, your cross-validation data, and the grid of values to be tested. I specify <code>save_pred = TRUE</code> which is going to save all of the cross-validation predictions for later evaluation. Note that this is going to take awhile. A grid of 40 took ~6 hours on my machine. I'd set this off overnight and save the results so you can reload the object without rebuilding every time.
+
+```{r, eval = F}
+  xgb_res <- tune_grid(
+    qb_workflow,
+    resamples = qb_folds,
+    grid = xgb_grid,
+    control = control_grid(save_pred = TRUE)
+  )
+```
+
+Julia Silge's post had a plot to show the relationship between different parameter values and model performance that I'm going to use here. It's tough to draw any sweeping conclusions though it looks like higher values of mtry and, to a certain extent, tree depth perform better.
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  dplyr::select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC") +
+  theme_minimal()
+```
+
+We can extract the best-performing set of hyperparameters using the <code>select_best()</code> function and use those values to finalize our workflow.
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+
+qb_xgb <- finalize_workflow(
+  qb_workflow,
+  parameters = best_auc
+)
+```
+
+At this point we're ready to evaluate the performance of the model trained on our training data with our chosen hyperparameters on our test data which we can do with the <code>last_fit()</code> function. We'll need to give the function our finalized workflow as well as our split data.
+
+```{r, eval = F}
+final_mod <- last_fit(qb_xgb, dat_split)
+```
+
+### Model Evaluation
+We can find out just how well the model did using <code>collect_metrics</code>. We ended up with 69% accuracy and an AUC of .76 which seems about right given the application. It's safe to assume that coaches are playing some kind of mixed-strategy equilibrium and are choosing plays specifically to avoid easy pattern detection, but we're clearly identifying patterns that make passing more or less likely. Again, Julia Silge did a great job visualizing model outputs in her post and I'm going to basically lift her code for this ROC curve plot
+
+```{r}
+collect_metrics(final_mod)
+final_mod %>%
+  collect_predictions() %>%
+  roc_curve(qb_dropback, .pred_0) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(size = 1.5, color = "midnightblue") +
+  xlab('1 - Specificity') +
+  ylab('Sensitivity') +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  ) +
+  ggtitle('ROC Curve') +
+  theme_minimal()
+```
+
+As a final check on our results let's look at calibration in our test data. We want the plays where we give a .75 pass probability to have a .75 pass probability and it looks like that's the case! There's only 14 plays in the far right dot so I'm not going to lose any sleep over it.
+
+```{r}
+final_mod %>%
+  collect_predictions() %>%
+  mutate(pred_rounded = round(.pred_1,1)) %>%
+  group_by(pred_rounded) %>%
+  summarise(mean_prediction = mean(.pred_1),
+            mean_actual = mean(as.numeric(qb_dropback) - 1),
+            n = n(),
+            se = sd(as.numeric(qb_dropback) - 1 - .pred_1)/sqrt(n)) %>%
+  ggplot(aes(x = pred_rounded, y = mean_actual)) +
+  geom_abline() +
+  geom_point(aes(size = n)) +
+  theme_minimal() +
+  xlab('Predicted Probability') +
+  ylab('Actual Probability') +
+  ggtitle('Calibration Plot, Test Data') +
+  ylim(0,1) +
+  xlim(0,1)
+```
+
+Finally, now that we've built some confidence in the model we're going to build (using <code>fit()</code>) and predict (using <code>predict()</code>) the model on all data since 2016.
+
+```{r, eval = F}
+final_qb_mod <- fit(qb_xgb, post16)
+```
+
+```{r}
+post16_pred_dat <- filter(dat, season >= 2016 & 
+                   season_type == 'REG' & 
+                   down %in% c(1,2,3) &
+                   !is.na(qb_dropback) &
+                   !is.na(score_differential)) %>%
+  mutate(qb_dropback = factor(qb_dropback),
+         off_to = if_else(posteam_type == 'away', away_timeouts_remaining, home_timeouts_remaining),
+         def_to = if_else(posteam_type == 'away', home_timeouts_remaining, away_timeouts_remaining)) %>%
+  dplyr::select(qb_dropback, down, ydstogo, yardline_100, score_differential, qtr, half_seconds_remaining, off_to, def_to, epa, posteam, defteam, season)
+
+post16_pred_dat$dropback_prob <- predict(final_qb_mod, new_data = post16_pred_dat, type = 'prob')$.pred_1
+```
+
+And as a basic sanity check let's make sure the model thinks passing is more likely in situations that we would expect. Generally speaking, throwing is more likely on third down and more likely with more yards to go which is what we'd hope to see.
+
+```{r}
+post16_pred_dat %>%
+  mutate(Down = factor(down)) %>%
+  filter(down > 1 & ydstogo < 15) %>%
+  ggplot(aes(x = ydstogo, y = dropback_prob, colour = Down)) +
+  geom_smooth() +
+  ylim(0,1) +
+  scale_x_continuous(breaks = seq(0,15, by = 1)) +
+  ylab('Predicted Dropback Probability') +
+  xlab('Yards to Go') +
+  theme_minimal()
+```
+
+
+## A Quick Look Ahead
+
+In the future we'll want to build a model that builds in additional information, but for now we can build a simple model to get an idea of which teams were more or less likely to pass than we'd expect. Going back to the equation at the top of the post, we'll fit a multilevel model where we predict the probability of a qb dropback as a function of our predicted dropback probability along with team random effects. We can interpret these effects as the degree to which teams differ from the expectation set out by the model we made above.
+
+We'll fit the model in stan, a popular language for fitting Bayesian models and one that people find especially useful for multilevel models. The stan code is displayed below.
+
+```{r, eval = F}
+data{
+  int<lower = 0> N; //number of observations
+  int<lower = 1> I; //number of team/seasons
+  int<lower = 0, upper = 1> y[N]; //qb_dropback
+  int<lower = 0, upper = I> ii[N]; //team/season indicator
+  vector[N] phat; //fitted probability from xgboost model
+}
+parameters{
+  vector[I] mu_raw; //team/season random effects
+  real beta_phat; //effect of p_hat, should be ~ 1
+  real alpha; //intercept
+  real<lower = 0> sigma_mu; //standard deviation of random effects
+}
+transformed parameters{
+  vector[I] mu = sigma_mu * mu_raw;
+}
+model{
+  alpha ~ normal(0, .25);
+  beta_phat ~ normal(1,.25);
+  mu_raw ~ normal(0,1);
+  sigma_mu ~ normal(0,1);
+  
+  y ~ bernoulli_logit(alpha + mu[ii] + beta_phat * phat);
+}
+```
+
+```{r, eval = F}
+stan_mod <- stan_model(file = '/stan-models/pass-prob-stan-model-no-epa.stan')
+
+stan_dat_no_epa <- list(
+  N = nrow(final_pred_dat),
+  I = max(final_pred_dat$team_idx),
+  y = as.numeric(final_pred_dat$qb_dropback) - 1,
+  ii = final_pred_dat$team_idx,
+  phat = arm::logit(final_pred_dat$dropback_prob)
+)
+
+fit_no_epa <- sampling(stan_mod, data = stan_dat_no_epa, cores = 3, chains = 4, iter = 1000)
+```
+
+Below we'll print some parameters from the model. $alpha$ is the intercept, $beta_phat$ is the coefficient on the predicted pass probability from our xgboost model, and $sigma_mu$ is the standard deviation in team effects. We'd expect a coefficient of 1 on $beta_phat$, so I should probably go back and look at why it's coming out a little high. While there's clearly a difference between $beta_phat$ and our expectation, it's pretty small in substantive terms. If our xgboost model was saying that the probability of a pass is .6, this model would suggest that that true probability is something like .61 for an average team. The .18 value of $sigma_mu$ means that our predicted probabilities for different teams would range from about .52 on the low end and .69 on the high end for a play where an average team is at .6.
+
+```{r}
+print(fit_no_epa, pars = c('alpha','beta_phat','sigma_mu'))
+```
+
+
+
+```{r, eval = F}
+stan_mod_epa <- stan_model(file = 'C:/Users/richjand/Documents/nfl-run-pass/stan-models/pass-prob-stan-model-with-epa.stan')
+
+x <- data.matrix(data.frame(arm::logit(final_pred_dat$dropback_prob), final_pred_dat$passing_re - final_pred_dat$rushing_re))
+  
+stan_dat_epa <- list(
+  N = nrow(final_pred_dat),
+  K = ncol(x),
+  I = max(final_pred_dat$team_idx),
+  y = as.numeric(final_pred_dat$qb_dropback) - 1,
+  ii = final_pred_dat$team_idx,
+  x = x
+)
+
+fit_epa <- sampling(stan_mod_epa, data = stan_dat_epa, cores = 3, chains = 4, iter = 1000)
+```
+
+
+
+```{r}
+print(fit_epa, pars = c('alpha','beta','sigma_mu'))
+```
